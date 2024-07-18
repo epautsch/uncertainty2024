@@ -7,6 +7,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torchvision import datasets, transforms
 import torch.multiprocessing as mp
 import torch.distributed as dist
+import os
 import time
 
 
@@ -23,6 +24,8 @@ epochs = args.epochs
 num_ensembles = args.num_ensembles
 
 def setup(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
@@ -103,28 +106,24 @@ def get_data_loaders(batch_size, rank=None, world_size=1):
 
     return train_loader, test_loader
 
-def train(models, train_loader, criterion, optimizers, device):
-    for model in models:
-        model.train()
+def train(model, train_loader, criterion, optimizer, device):
+    model.train()
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
-        for model, optimizer in zip(models, optimizers):
-            optimizer.zero_grad()
-            output, _ = model(data)
-            loss = criterion(output, target)
-            loss.backward()
-            optimizer.step()
+        optimizer.zero_grad()
+        output, _ = model(data)
+        loss = criterion(output, target)
+        loss.backward()
+        optimizer.step()
 
-def evaluate(models, test_loader, criterion, device):
-    for model in models:
-        model.eval()
+def evaluate(model, test_loader, criterion, device):
+    model.eval()
     test_loss = 0
     correct = 0
     with torch.no_grad():
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
-            outputs = [model(data)[0] for model in models]
-            output = torch.mean(torch.stack(outputs), dim=0)
+            output, _ = model(data)
             test_loss += criterion(output, target).item()
             pred = output.argmax(dim=1, keepdim=True)
             correct += pred.eq(target.view_as(pred)).sum().item()
@@ -141,36 +140,28 @@ def main(rank, world_size, use_ddp):
 
     train_loader, test_loader = get_data_loaders(batch_size, rank, world_size)
 
-    models = FusionNet(num_ensembles).to(device)
+    model = FusionNet(num_ensembles).to(device)
     if use_ddp:
-        model = nn.parallel.DistributedDataParallel(model, device_ids=[rank])
+        model = nn.parallel.DistributedDataParallel(model, device_ids=[rank], find_unused_parameters=True)
     optimizer = optim.Adam(model.parameters(), lr=0.01)
-
-    optimizers = []
-    for _ in range(num_ensembles):
-        model = FusionNet(num_ensembles).to(device)
-        if use_ddp:
-            model = nn.parallel.DistributedDataParallel(model, device_ids=[rank])
-        optimizer = optim.Adam(model.parameters(), lr=0.01)
-        models.append(model)
-        optimizers.append(optimizer)
 
     criterion = nn.CrossEntropyLoss()
 
     start_time = time.time()
     for epoch in range(1, epochs + 1):
-        train(models, train_loader, criterion, optimizers, device)
+        train(model, train_loader, criterion, optimizer, device)
     end_time = time.time()
     training_time = end_time - start_time
     if not use_ddp or rank == 0:
         print(f'Training time: {training_time} seconds')
 
     start_time = time.time()
-    test_loss, accuracy = evaluate(models, test_loader, criterion, device)
+    test_loss, accuracy = evaluate(model, test_loader, criterion, device)
     end_time = time.time()
     eval_time = end_time - start_time
     if not use_ddp or rank == 0:
         print(f'Evaluation time: {eval_time} seconds')
+        print(f'Test Loss: {test_loss:.4f}, Accuracy: {accuracy:.2f}%')
 
     if use_ddp:
         cleanup()
